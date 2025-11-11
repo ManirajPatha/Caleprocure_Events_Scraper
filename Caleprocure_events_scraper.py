@@ -14,6 +14,7 @@ from selenium.common.exceptions import (
     NoSuchElementException,
     ElementNotInteractableException,
     StaleElementReferenceException,
+    ElementClickInterceptedException,
 )
 
 START_URL = "https://caleprocure.ca.gov/pages/Events-BS3/event-search.aspx"
@@ -27,7 +28,6 @@ LABELS = [
     "Dept",
     "Dept:",
     "Department",
-    # "Judicial Branch",  # <- removed: it's a value, not a label
     "Format/Type",
     "Format/Type:",
     "Event Version",
@@ -75,9 +75,44 @@ def clean_lines(text: str) -> List[str]:
         text = text.replace(BANNER_SNIPPET, "")
     return [l.strip() for l in text.splitlines() if l.strip()]
 
+# ---------- popup killer ----------
+
+def dismiss_popups(driver):
+    """
+    Silently close the 'Popup Blocked!!' / Notice modal if it exists.
+    This prevents ElementClickInterceptedException blocking row clicks.
+    """
+    try:
+        modals = driver.find_elements(
+            By.XPATH,
+            "//div[contains(@class,'modal') and contains(@class,'in')"
+            " and (contains(.,'Popup Blocked') or contains(@id,'popupMessageModal') or .//h4[normalize-space()='Notice'])]"
+        )
+        for m in modals:
+            try:
+                btn = m.find_element(
+                    By.XPATH,
+                    ".//button[contains(normalize-space(),'Close')]"
+                )
+                if btn.is_displayed():
+                    try:
+                        btn.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", btn)
+            except NoSuchElementException:
+                try:
+                    driver.execute_script(
+                        "arguments[0].style.display='none';", m
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
 # ================== list page helpers ==================
 
 def goto_events_section(driver):
+    dismiss_popups(driver)
     try:
         heading = driver.find_element(
             By.XPATH,
@@ -161,6 +196,12 @@ def robust_open_new_tab(driver, clickable, guessed_url: Optional[str]) -> None:
 
     try:
         clickable.click()
+    except ElementClickInterceptedException:
+        dismiss_popups(driver)
+        try:
+            driver.execute_script("arguments[0].click();", clickable)
+        except Exception:
+            pass
     except ElementNotInteractableException:
         try:
             driver.execute_script("arguments[0].click();", clickable)
@@ -230,11 +271,9 @@ def find_value_by_label(driver, label: str) -> Optional[str]:
     return txt
 
 def extract_label_values(driver) -> Dict[str, str]:
-    # First, handle the common pattern:
-    # <small class="text-muted">Dept:</small><br>
-    # <span data-if-label="dept" ...>Judicial Branch</span>
     details: Dict[str, str] = {}
 
+    # Dept from explicit attribute when present
     try:
         dept_span = driver.find_element(
             By.XPATH,
@@ -251,7 +290,6 @@ def extract_label_values(driver) -> Dict[str, str]:
         "Dept:": "Dept",
         "Dept": "Dept",
         "Department": "Dept",
-        # "Judicial Branch": "Dept",  # <- removed: it's a value not a label
         "Format/Type:": "Format/Type",
         "Format/Type": "Format/Type",
         "Event Version": "Event Version",
@@ -261,10 +299,8 @@ def extract_label_values(driver) -> Dict[str, str]:
     }
 
     for label, key in label_map.items():
-        # Skip label-based Dept extraction if we already captured Dept from data-if-label
         if key == "Dept" and "Dept" in details:
             continue
-
         v = find_value_by_label(driver, label)
         if not v:
             continue
@@ -499,21 +535,9 @@ def extract_full_description(driver) -> Optional[str]:
 # ================== Attachments ==================
 
 def get_attachments(driver) -> List[str]:
-    """
-    From the Event Details page:
-    - Click 'View Event Package'
-    - On attachments table, for each row:
-        - Click its download icon/button/link
-        - Wait for 'Download Attachment' popup
-        - Read href from <a id="downloadButton" ...>
-        - Close popup
-    - Return list of all unique hrefs
-    - Navigate back to the details page.
-    """
     attachments: List[str] = []
     detail_url = driver.current_url
 
-    # 1) Open attachments page via "View Event Package"
     try:
         vp = driver.find_element(
             By.XPATH,
@@ -531,7 +555,6 @@ def get_attachments(driver) -> List[str]:
 
     table_xpath = "//table[.//th[normalize-space()='Attached File']]"
 
-    # 2) Wait for attachments table to appear
     try:
         WebDriverWait(driver, 20).until(
             EC.presence_of_element_located(
@@ -539,13 +562,11 @@ def get_attachments(driver) -> List[str]:
             )
         )
     except TimeoutException:
-        # If it never loads, go back to detail page
         driver.get(detail_url)
         time.sleep(2)
         return attachments
 
     def current_rows():
-        # always fetch fresh rows to avoid stale references
         return driver.find_elements(
             By.XPATH, table_xpath + "//tbody/tr[.//td]"
         )
@@ -555,16 +576,12 @@ def get_attachments(driver) -> List[str]:
         rows = current_rows()
         if idx >= len(rows):
             break
-
         tr = rows[idx]
         idx += 1
 
         try:
-            # 3) Find something clickable in the Download column
-
             clickable = None
 
-            # common: button with fa-download icon
             btns = tr.find_elements(
                 By.XPATH,
                 ".//td[last()]//button[.//*[contains(@class,'fa-download')]]"
@@ -572,7 +589,6 @@ def get_attachments(driver) -> List[str]:
             if btns:
                 clickable = btns[0]
 
-            # icon inside link/button
             if clickable is None:
                 icons = tr.find_elements(
                     By.XPATH,
@@ -587,7 +603,6 @@ def get_attachments(driver) -> List[str]:
                     except NoSuchElementException:
                         clickable = icons[0]
 
-            # fallback: any button or link in last cell
             if clickable is None:
                 btn_or_link = tr.find_elements(
                     By.XPATH, ".//td[last()]//button | .//td[last()]//a"
@@ -596,7 +611,6 @@ def get_attachments(driver) -> List[str]:
                     clickable = btn_or_link[0]
 
             if clickable is None:
-                # nothing clickable for this attachment row
                 continue
 
             scroll_into_view(driver, clickable)
@@ -605,7 +619,6 @@ def get_attachments(driver) -> List[str]:
             except Exception:
                 driver.execute_script("arguments[0].click();", clickable)
 
-            # 4) Wait for the popup with Download Attachment
             try:
                 WebDriverWait(driver, 15).until(
                     EC.visibility_of_element_located(
@@ -613,7 +626,6 @@ def get_attachments(driver) -> List[str]:
                     )
                 )
             except TimeoutException:
-                # try close any popup if half-open, then continue
                 try:
                     close = driver.find_element(
                         By.XPATH,
@@ -627,7 +639,6 @@ def get_attachments(driver) -> List[str]:
                     pass
                 continue
 
-            # 5) Grab the href from Download Attachment
             try:
                 a = driver.find_element(By.ID, "downloadButton")
                 href = (a.get_attribute("href") or "").strip()
@@ -636,7 +647,6 @@ def get_attachments(driver) -> List[str]:
             except NoSuchElementException:
                 pass
 
-            # 6) Close popup
             try:
                 close = driver.find_element(
                     By.XPATH,
@@ -647,7 +657,6 @@ def get_attachments(driver) -> List[str]:
                 except Exception:
                     driver.execute_script("arguments[0].click();", close)
             except NoSuchElementException:
-                # fallback: ESC
                 driver.execute_script(
                     "var e = new KeyboardEvent('keydown', {key:'Escape'});"
                     "document.dispatchEvent(e);"
@@ -656,11 +665,9 @@ def get_attachments(driver) -> List[str]:
             time.sleep(0.25)
 
         except StaleElementReferenceException:
-            # row changed; just move on to next index
             continue
         except Exception as e:
             print(f"[WARN] attachment row {idx} error: {e}")
-            # best-effort close popup if any, then continue
             try:
                 close = driver.find_element(
                     By.XPATH,
@@ -674,7 +681,6 @@ def get_attachments(driver) -> List[str]:
                 pass
             continue
 
-    # 7) Go back to Event Details page
     try:
         ret = driver.find_element(
             By.XPATH,
@@ -696,7 +702,6 @@ def get_attachments(driver) -> List[str]:
 # ================== Event Name from details page ==================
 
 def get_event_name_from_details_page(driver) -> Optional[str]:
-    # 1) explicit data-label
     try:
         el = driver.find_element(
             By.XPATH,
@@ -708,7 +713,6 @@ def get_event_name_from_details_page(driver) -> Optional[str]:
     except NoSuchElementException:
         pass
 
-    # 2) visual bold h3
     try:
         el = driver.find_element(
             By.XPATH,
@@ -720,7 +724,6 @@ def get_event_name_from_details_page(driver) -> Optional[str]:
     except NoSuchElementException:
         pass
 
-    # 3) nearest element above Details
     try:
         el = driver.find_element(
             By.XPATH,
@@ -744,7 +747,6 @@ def extract_event_details(driver, list_row_event_name: str) -> Optional[Dict]:
 
     details = extract_label_values(driver)
 
-    # Event Name: prefer details-page title, else list-row Event Name
     event_name = get_event_name_from_details_page(driver)
     if not event_name:
         event_name = clean_text(list_row_event_name) or ""
@@ -781,6 +783,7 @@ def extract_event_details(driver, list_row_event_name: str) -> Optional[Dict]:
 # ================== pagination ==================
 
 def click_next_if_available(driver) -> bool:
+    dismiss_popups(driver)
     for xp in [
         "//a[normalize-space()='Next' and not(contains(@class,'disabled'))]",
         "//button[normalize-space()='Next' and not(contains(@class,'disabled'))]",
@@ -801,75 +804,111 @@ def click_next_if_available(driver) -> bool:
             continue
     return False
 
-# ================== main loop ==================
+# ================== main loop with global range ==================
 
-def process_all(driver, max_pages=0, limit: int = 0) -> List[Dict]:
+def process_all(
+    driver,
+    max_pages: int = 0,
+    limit: int = 0,
+    start_index: int = 1,
+    end_index: Optional[int] = None,
+) -> List[Dict]:
     all_events: List[Dict] = []
     page_idx = 0
+    global_row = 0  # 1-based row counter across all pages
 
     while True:
         page_idx += 1
-        # Always ensure we are on the search page + EVENTS table
+
         if "event-search.aspx" not in driver.current_url:
             driver.get(START_URL)
             time.sleep(3)
+        dismiss_popups(driver)
         goto_events_section(driver)
 
         rows = get_event_rows(driver)
         print(f"[INFO] Page {page_idx}: Found {len(rows)} rows")
 
-        for i in range(len(rows)):
+        i = 0
+        while i < len(rows):
+            # Stop if we've passed the requested range
+            if end_index is not None and global_row >= end_index:
+                return all_events
             if limit and len(all_events) >= limit:
                 return all_events
 
-            # Re-grab rows each time (in case DOM changed)
-            rows = get_event_rows(driver)
-            if i >= len(rows):
-                break
+            try:
+                dismiss_popups(driver)
 
-            row = rows[i]
-            tds = row.find_elements(By.XPATH, ".//td")
-            if len(tds) < 2:
-                continue
+                rows = get_event_rows(driver)
+                if i >= len(rows):
+                    break
 
-            time.sleep(1.0)
-            event_name = get_event_name_from_row(row)
-            print(f"[ROW {i+1}] {event_name[:120]}")
+                row = rows[i]
+                i += 1
 
-            clickable, url_guess = row_click_target_and_url(row)
-            robust_open_new_tab(driver, clickable, url_guess)
+                # Increment global row index for this row
+                global_row += 1
+                row_num = global_row
 
-            if not ensure_event_loaded_or_skip(driver):
-                # Close whatever tab we opened and go back to search
+                # If below start_index, just skip without processing
+                if row_num < start_index:
+                    continue
+                # If beyond end_index (already checked at top), bail
+                if end_index is not None and row_num > end_index:
+                    return all_events
+
+                tds = row.find_elements(By.XPATH, ".//td")
+                if len(tds) < 2:
+                    continue
+
+                time.sleep(1.0)
+                event_name = get_event_name_from_row(row)
+                print(f"[ROW {row_num}] {event_name[:120]}")
+
+                clickable, url_guess = row_click_target_and_url(row)
+                robust_open_new_tab(driver, clickable, url_guess)
+
+                if not ensure_event_loaded_or_skip(driver):
+                    if len(driver.window_handles) > 1:
+                        driver.close()
+                        driver.switch_to.window(driver.window_handles[0])
+                    if "event-search.aspx" not in driver.current_url:
+                        driver.get(START_URL)
+                        time.sleep(3)
+                    continue
+
+                data = extract_event_details(driver, event_name)
+                if data:
+                    all_events.append(data)
+
                 if len(driver.window_handles) > 1:
                     driver.close()
                     driver.switch_to.window(driver.window_handles[0])
-                # If we somehow lost the search page, reopen it
                 if "event-search.aspx" not in driver.current_url:
                     driver.get(START_URL)
                     time.sleep(3)
+
+                time.sleep(0.25)
+
+            except Exception as e:
+                print(f"[WARN] row {global_row} error: {e}")
+                try:
+                    while len(driver.window_handles) > 1:
+                        driver.switch_to.window(driver.window_handles[-1])
+                        driver.close()
+                    driver.switch_to.window(driver.window_handles[0])
+                except Exception:
+                    pass
+                try:
+                    if "event-search.aspx" not in driver.current_url:
+                        driver.get(START_URL)
+                        time.sleep(3)
+                        goto_events_section(driver)
+                except Exception:
+                    pass
                 continue
 
-            data = extract_event_details(driver, event_name)
-            if data:
-                all_events.append(data)
-
-            # Close detail tab and return to search page
-            if len(driver.window_handles) > 1:
-                driver.close()
-                driver.switch_to.window(driver.window_handles[0])
-
-            # Hard guarantee: if we are not on search page now, reopen it
-            if "event-search.aspx" not in driver.current_url:
-                driver.get(START_URL)
-                time.sleep(3)
-
-            time.sleep(0.25)
-
-            if limit and len(all_events) >= limit:
-                return all_events
-
-        # pagination / exit
         if max_pages and page_idx >= max_pages:
             break
         if not click_next_if_available(driver):
@@ -886,9 +925,23 @@ def main():
     parser.add_argument("--max-pages", type=int, default=0)
     parser.add_argument("--initial-wait", type=float, default=10.0)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--upto", type=str, default="")  # NEW: row range, e.g. "1-100"
     args = parser.parse_args()
 
+    # Parse upto range
+    start_index = 1
+    end_index = None
+    if args.upto:
+        m = re.match(r"\s*(\d+)\s*-\s*(\d+)\s*", args.upto)
+        if m:
+            start_index = int(m.group(1))
+            end_index = int(m.group(2))
+            if end_index < start_index:
+                start_index, end_index = end_index, start_index
+
     driver = build_driver(headless=args.headless)
+    results: List[Dict] = []
+
     try:
         print("[STEP] Open search page…")
         driver.get(START_URL)
@@ -899,13 +952,21 @@ def main():
             driver,
             max_pages=args.max_pages,
             limit=args.limit,
+            start_index=start_index,
+            end_index=end_index,
         )
 
-        print(f"[OK] Total events scraped: {len(results)}")
-        with open(args.out_json, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-        print(f"[OK] Saved JSON: {args.out_json}")
+    except Exception as e:
+        print(f"[ERROR] Scraper stopped due to: {e}")
+
     finally:
+        try:
+            print(f"[OK] Total events scraped: {len(results)}")
+            with open(args.out_json, "w", encoding="utf-8") as f:
+                json.dump(results, f, ensure_ascii=False, indent=2)
+            print(f"[OK] Saved JSON: {args.out_json}")
+        except Exception as save_err:
+            print(f"[ERROR] Failed to save JSON: {save_err}")
         driver.quit()
 
 if __name__ == "__main__":
